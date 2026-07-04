@@ -13,6 +13,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from rag.chunker import FixedSizeChunker
 from rag.retriever import HybridRetriever
 from rag.eval import RAGEvaluator
