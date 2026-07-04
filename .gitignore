@@ -41,3 +41,4 @@ notebooks/.ipynb_checkpoints/
 *.key
 *.pem
 secrets/
+chroma_data/
