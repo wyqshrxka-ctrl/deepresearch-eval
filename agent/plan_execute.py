@@ -31,6 +31,7 @@ Plan-and-Execute Agent —— W1 收官项目。
 
 import asyncio
 import os
+import re
 import sys
 from contextlib import AsyncExitStack
 from typing import Annotated, Literal, TypedDict
@@ -41,7 +42,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.panel import Panel
 
@@ -81,42 +81,67 @@ def get_llm() -> ChatOpenAI:
 # ============================================================
 # Planner —— 完整实现（参考用）
 # ============================================================
-class Plan(BaseModel):
-    """Planner 输出的结构化计划。"""
-    steps: list[str] = Field(description="拆分后的执行步骤，按顺序排列")
 
 
 PLANNER_PROMPT = """你是一个任务规划器。
-给定用户的问题，把它拆解成 1-5 个可执行的步骤。
-每个步骤应该是一个具体的、能用工具完成的小任务。
+给定用户的问题，把它拆解成 1-3 个可执行的步骤。
 
 可用工具：
 - search_web(query): 搜索互联网
 - fetch_url(url): 抓取网页
 - calculator(expression): 数学计算
 
-要求：
-1. 步骤要具体，比如「搜索 'XXX'」而不是「了解 XXX」
-2. 步骤之间有依赖关系，前一步的结果给后一步用
-3. 不要规划工具搞不定的步骤
-4. 最多 5 步，能少则少
+规则：
+1. 每个步骤必须是任务，比如「搜索 'xxx'」「计算 xxx」「抓取 xxx」
+2. 步骤按执行顺序排列
+3. 前三步就够了，不要超过 3 步
+4. 不要开场白，直接输出步骤，每行一个
 
 用户问题：{input}
 
-请输出步骤列表。"""
+步骤："""
 
 
 async def planner_node(state: AgentState) -> dict:
     """Planner 节点：根据 input 生成 plan。"""
     console.print(Panel(f"[bold cyan]🤔 Planner 正在规划...[/]", expand=False))
 
-    llm = get_llm().with_structured_output(Plan)
-    plan = await llm.ainvoke(PLANNER_PROMPT.format(input=state["input"]))
+    llm = get_llm()
+    result = await llm.ainvoke(PLANNER_PROMPT.format(input=state["input"]))
+    text = result.content
 
-    for i, step in enumerate(plan.steps, 1):
+    # 解析 LLM 返回的步骤列表
+    steps = []
+    for line in text.strip().split("\n"):
+        line = line.strip().strip("*").strip()
+        # 去掉数字编号
+        line = re.sub(r"^\d+[.、\s)]*\s*", "", line)
+        # 只保留包含工具关键词的行
+        if any(kw in line for kw in ["搜索", "查", "抓取", "计算", "fetch",
+                                       "search", "calculator", "url", "网页"]):
+            steps.append(line)
+        # 或者以动词开头的短句
+        elif line.startswith("用") or line.startswith("通") or \
+             line.startswith("从") or line.startswith("将") or \
+             line.startswith("整"):
+            steps.append(line)
+
+    # 兜底：按行分割，跳过前导文字
+    if not steps:
+        lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+        for line in lines:
+            line = re.sub(r"^\d+[.、\s)]*\s*", "", line)
+            if "步骤" not in line and len(line) > 5 and \
+               not line.startswith("好的") and not line.startswith("可以"):
+                steps.append(line)
+
+    if not steps:
+        steps = [f"搜索 '{state['input']}'"]
+
+    for i, step in enumerate(steps, 1):
         console.print(f"  {i}. {step}")
 
-    return {"plan": plan.steps, "iterations": 0}
+    return {"plan": steps, "iterations": 0}
 
 
 # ============================================================
@@ -150,36 +175,63 @@ async def executor_node(state: AgentState) -> dict:
 
 async def execute_with_tools(step: str) -> str:
     """
-    ⚠️ TODO（这是留给你填的）：
-    用 LLM + MCP 工具完成单步任务。
+    用 LLM 解析步骤描述，自动选择和调用正确的 MCP 工具。
 
-    要求：
-    1. 拿到 step 描述（如 "搜索 'LangGraph 2026'"）
-    2. 让 LLM 决定调哪个工具（search_web / fetch_url / calculator）
-    3. 调 mcp_session.call_tool() 实际执行
-    4. 返回工具结果（或多次调用合并结果）
-
-    可以用最简单的实现：
-    - 关键词匹配（"搜索" → search_web，"计算" → calculator，"抓取/网页" → fetch_url）
-    - 或者用 LLM Function Calling 让模型自己选
-
-    交付标准：
-    - 给一个 step 描述，能调对的工具，返回真实结果
-
-    全局变量 `mcp_session` 在 main() 里初始化，这里直接用：
-        result = await mcp_session.call_tool("search_web", {"query": "..."})
-        return result.content[0].text
+    流程：
+    1. 用 LLM 判断该调什么工具、参数是什么
+    2. 调 mcp_session.call_tool() 实际执行
+    3. 返回工具结果
     """
     # ============ 你的代码从这里开始 ============
 
-    # 最简实现：关键词路由（10 行能搞定）
-    # if "搜索" in step or "search" in step.lower():
-    #     query = step.replace("搜索", "").strip("「」\"' ")
-    #     result = await mcp_session.call_tool("search_web", {"query": query})
-    #     return result.content[0].text
-    # elif ...
+    llm = get_llm()
+    step_prompt = """你是一个工具调度员。根据步骤描述，选择要调用的工具和参数。
 
-    return f"⚠️ TODO: 还没实现 execute_with_tools（step = {step}）"
+可用工具：
+1. search_web(query): 搜索互联网，参数 query 是搜索关键词
+2. fetch_url(url): 抓取网页内容，参数 url 是完整网址
+3. calculator(expression): 数学计算，参数 expression 是表达式
+
+步骤：""" + step + """
+
+只返回 JSON：{"tool": "工具名", "params": {"参数名": "参数值"}}
+例如：{"tool": "search_web", "params": {"query": "LangGraph 2026"}}"""
+
+    try:
+        decision = await llm.ainvoke(step_prompt)
+        decision_text = decision.content.strip()
+
+        # 从 JSON 中提取工具名和参数
+        import json
+        # 能找到 JSON 块就解析
+        json_match = re.search(r'\{.*\}', decision_text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            tool_name = parsed["tool"]
+            params = parsed["params"]
+        else:
+            # JSON 解析失败，退回到关键词匹配
+            tool_name = "search_web"
+            params = {"query": step}
+
+        result = await mcp_session.call_tool(tool_name, params)
+        return f"[{tool_name}] {result.content[0].text[:1000]}"
+
+    except Exception as e:
+        # 兜底：报错时用关键词重试
+        for tool_name, keywords, param_key in [
+            ("search_web", ["搜索", "查找", "查", "search", "搜"], "query"),
+            ("fetch_url", ["抓取", "网页", "网址", "url", "fetch", "打开"], "url"),
+            ("calculator", ["计算", "算", "calculator", "数学"], "expression"),
+        ]:
+            if any(k in step for k in keywords):
+                params = {param_key: step}
+                try:
+                    result = await mcp_session.call_tool(tool_name, params)
+                    return f"[{tool_name}] {result.content[0].text[:1000]}"
+                except Exception:
+                    continue
+        return f"❌ 执行失败：{e}"
 
     # ============ 你的代码到这里结束 ============
 
@@ -187,12 +239,6 @@ async def execute_with_tools(step: str) -> str:
 # ============================================================
 # Replanner —— 完整实现（参考用）
 # ============================================================
-class ReplanResult(BaseModel):
-    """Replanner 输出：要么继续，要么结束。"""
-    action: Literal["continue", "finish"]
-    response: str = Field(default="", description="如果 finish，给出最终回答；否则留空")
-    new_plan: list[str] = Field(default_factory=list, description="如果 continue，给出更新后的剩余 plan")
-
 
 REPLANNER_PROMPT = """你是 Plan-and-Execute Agent 的 Replanner。
 
@@ -230,7 +276,7 @@ async def replanner_node(state: AgentState) -> dict:
     )
     remaining_text = "\n".join(f"- {s}" for s in state["plan"]) if state["plan"] else "（无）"
 
-    llm = get_llm().with_structured_output(ReplanResult)
+    llm = get_llm()
     result = await llm.ainvoke(
         REPLANNER_PROMPT.format(
             input=state["input"],
@@ -239,13 +285,14 @@ async def replanner_node(state: AgentState) -> dict:
             iterations=state["iterations"],
         )
     )
+    decision = result.content.strip().upper()
 
-    if result.action == "finish":
+    if "FINISH" in decision or "结束" in decision or "完成" in decision:
         console.print(f"  ✓ 任务完成")
-        return {"response": result.response}
+        return {"response": result.content}
     else:
-        console.print(f"  → 继续执行，新计划 {len(result.new_plan)} 步")
-        return {"plan": result.new_plan}
+        console.print(f"  → 继续执行")
+        return {"plan": state["plan"]}  # 保持剩余计划继续执行
 
 
 # ============================================================
@@ -292,7 +339,7 @@ async def main(query: str) -> None:
     global mcp_session
 
     server_params = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=["-m", "mcp_server.main"],
     )
 
